@@ -4,13 +4,10 @@ import { useState, useEffect } from "react";
 import { ethers } from "ethers";
 import { toast } from "sonner";
 
-// import * as bip39 from "bip39";
-// import * as ecc from "tiny-secp256k1";
-// import * as bip32 from "bip32";
-// import * as ed25519 from "ed25519-hd-key";
-// import * as nacl from "tweetnacl";
-// import { keccak256 } from "ethereum-cryptography/keccak";
-// import bs58 from "bs58";
+import { generateMnemonic, mnemonicToSeedSync, validateMnemonic } from "bip39";
+import { derivePath } from "ed25519-hd-key";
+import bs58 from "bs58";
+import nacl from "tweetnacl";
 
 export default function Home() {
   const [page, setPage] = useState(1);
@@ -25,6 +22,7 @@ export default function Home() {
   const [accounts, setAccounts] = useState([]);
   const [currentAccountId, setCurrentAccountId] = useState(null);
   const [showAccountSelector, setShowAccountSelector] = useState(false);
+  const [selectedWalletType, setSelectedWalletType] = useState('ethereum');
 
   // Load data from localStorage on component mount
   useEffect(() => {
@@ -78,19 +76,19 @@ export default function Home() {
   }, [mnemonic, wallets, currentAccountId]);
 
   // Create new account
-  const createNewAccount = (mnemonicObj, accountName = null) => {
+  const createNewAccount = (mnemonicPhrase, accountName = null) => {
     const accountId = Date.now().toString();
     const newAccount = {
       id: accountId,
       name: accountName || `Account ${accounts.length + 1}`,
-      mnemonic: mnemonicObj,
+      mnemonic: mnemonicPhrase,
       wallets: [],
       createdAt: new Date().toISOString()
     };
     
     setAccounts(prev => [...prev, newAccount]);
     setCurrentAccountId(accountId);
-    setMnemonic(mnemonicObj);
+    setMnemonic(mnemonicPhrase);
     setWallets([]);
   };
 
@@ -140,42 +138,51 @@ export default function Home() {
   }
 
   // Validate mnemonic phrase
-  const validateMnemonic = (phrase) => {
-    const words = phrase.trim().split(/\s+/);
-    if (words.length !== 12) {
-      return "Seed phrase must be exactly 12 words";
-    }
+  // const validateMnemonic = (phrase) => {
+  //   const words = phrase.trim().split(/\s+/);
+  //   if (words.length !== 12) {
+  //     return "Seed phrase must be exactly 12 words";
+  //   }
     
-    // Try to create a wallet from the mnemonic to validate it
-    try {
-      ethers.HDNodeWallet.fromPhrase(phrase);
-      return null; // Valid
-    } catch (error) {
-      return "Invalid seed phrase. Please check your words and try again.";
-    }
-  };
+  //   // Try to create a wallet from the mnemonic to validate it
+  //   try {
+  //     ethers.HDNodeWallet.fromPhrase(phrase);
+  //     return null; // Valid
+  //   } catch (error) {
+  //     return "Invalid seed phrase. Please check your words and try again.";
+  //   }
+  // };
 
   // Handle import wallet
   const handleImportWallet = () => {
-    const error = validateMnemonic(importPhrase);
-    if (error) {
+    const trimmedPhrase = importPhrase.trim();
+    const words = trimmedPhrase.split(/\s+/);
+    
+    // Validate word count
+    if (words.length !== 12) {
+      const error = "Seed phrase must be exactly 12 words";
+      setImportError(error);
+      toast.error(error);
+      return;
+    }
+    
+    // Validate using bip39
+    if (!validateMnemonic(trimmedPhrase)) {
+      const error = "Invalid seed phrase. Please check your words and try again.";
       setImportError(error);
       toast.error(error);
       return;
     }
 
     try {
-      // Create mnemonic object from phrase
-      const mnemonicObj = ethers.HDNodeWallet.fromPhrase(importPhrase).mnemonic;
-      
       // Check if this mnemonic already exists
-      const existingAccount = accounts.find(acc => acc.mnemonic.phrase === mnemonicObj.phrase);
+      const existingAccount = accounts.find(acc => acc.mnemonic === trimmedPhrase);
       if (existingAccount) {
         toast.error("This wallet already exists in your accounts");
         return;
       }
       
-      createNewAccount(mnemonicObj, `Imported Account ${accounts.length + 1}`);
+      createNewAccount(trimmedPhrase, `Imported Account ${accounts.length + 1}`);
       setShowImportModal(false);
       setImportPhrase("");
       setImportError("");
@@ -194,11 +201,11 @@ export default function Home() {
     setImportError("");
   };
 
-  // Generate mnemonic only once (using ethers.Wallet.createRandom(256))
+  // Generate mnemonic only once (using bip39.generateMnemonic)
   const handleCreateMnemonic = () => {
     if (!mnemonic) {
-      const mnemonicObj = ethers.Wallet.createRandom(256).mnemonic;
-      createNewAccount(mnemonicObj);
+      const mnemonicPhrase = generateMnemonic(128);
+      createNewAccount(mnemonicPhrase);
     }
     setPage(3);
   };
@@ -206,15 +213,52 @@ export default function Home() {
   // Create a new wallet from mnemonic
   const handleCreateNewWallet = () => {
     if (!mnemonic) return;
-    // Get root HD node
-    const hdNode = ethers.HDNodeWallet.fromMnemonic(mnemonic);
-    // Use next index for HD wallet derivation (relative path)
+    
+    // Use next index for HD wallet derivation
     const index = wallets.length;
-    const path = `${index}/0`;
-    const wallet = hdNode.derivePath(path);
-    setWallets([...wallets, { address: wallet.address, path, privateKey: wallet.privateKey }]);
-    setPage(4);
+    const newWallet = handleWalletCreation(selectedWalletType, mnemonic, index);
+    
+    if (newWallet) {
+      setWallets([...wallets, newWallet]);
+      setPage(4);
+    }
   };
+
+  const handleWalletCreation = (pathType, mnemonicPhrase, index) => {
+    try {
+      if (!mnemonicPhrase || !validateMnemonic(mnemonicPhrase)) {
+        toast.error("Invalid mnemonic phrase");
+        return null;
+      }
+
+      const seed = mnemonicToSeedSync(mnemonicPhrase);
+      let path;
+      let derivedKey, address, privateKey, publicKey;
+
+      if (pathType === 'solana') {
+        path = `m/44'/501'/0'/${index}'`;
+        const { key: derivedKey } = derivePath(path, seed.toString('hex'));
+        const keyPair = nacl.sign.keyPair.fromSeed(derivedKey);
+        publicKey = keyPair.publicKey;
+        privateKey = keyPair.secretKey;
+        address = bs58.encode(publicKey);
+        return { address, path, privateKey: bs58.encode(privateKey), type: 'solana' };
+      }
+
+      if (pathType === 'ethereum') {
+        path = `m/44'/60'/0'/0/${index}`;
+        // Use ethers for Ethereum wallet creation
+        const hdNode = ethers.HDNodeWallet.fromPhrase(mnemonicPhrase);
+        const wallet = hdNode.derivePath(`0/${index}`);
+        return { address: wallet.address, path, privateKey: wallet.privateKey, type: 'ethereum' };
+      }
+
+    } catch (error) {
+      console.error("Error deriving wallet:", error);
+      toast.error("Failed to derive wallet");
+      return null;
+    }
+  }
 
   return (
     <div className="min-h-screen bg-gradient-to-br from-blue-50 to-indigo-100">
@@ -327,7 +371,7 @@ export default function Home() {
               
               <div className="bg-gray-50 rounded-xl p-6 mb-8">
                 <div className="grid grid-cols-3 gap-4 mb-6">
-                  {mnemonic?.phrase.split(' ').map((word, index) => (
+                  {mnemonic?.split(' ').map((word, index) => (
                     <div key={index} className="bg-white rounded-lg p-3 border border-gray-200">
                       <div className="text-xs text-gray-500 mb-1">{index + 1}</div>
                       <div className="font-mono font-semibold text-gray-900">{word}</div>
@@ -337,7 +381,7 @@ export default function Home() {
                 <div className="flex justify-center">
                   <button 
                     className="flex items-center px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition-colors"
-                    onClick={() => copyToClipboard(mnemonic?.phrase)}
+                    onClick={() => copyToClipboard(mnemonic)}
                   >
                     <svg className="w-4 h-4 mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                       <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z" />
@@ -389,6 +433,51 @@ export default function Home() {
                 <p className="text-gray-600">All wallets derived from your seed phrase</p>
               </div>
 
+              {/* Wallet Type Selector */}
+              <div className="bg-blue-50 rounded-xl p-6 mb-8">
+                <h3 className="font-semibold text-blue-900 mb-4">Create New Wallet</h3>
+                <div className="flex gap-4 mb-4">
+                  <button
+                    onClick={() => setSelectedWalletType('ethereum')}
+                    className={`flex-1 p-4 rounded-lg border-2 transition-colors ${
+                      selectedWalletType === 'ethereum'
+                        ? 'border-blue-500 bg-blue-100 text-blue-900'
+                        : 'border-gray-300 bg-white text-gray-700 hover:border-blue-300'
+                    }`}
+                  >
+                    <div className="flex items-center justify-center mb-2">
+                      <div className="w-8 h-8 bg-blue-600 rounded-full flex items-center justify-center">
+                        <span className="text-white font-bold text-sm">Ξ</span>
+                      </div>
+                    </div>
+                    <div className="font-semibold">Ethereum</div>
+                    <div className="text-sm opacity-75">EVM Compatible</div>
+                  </button>
+                  <button
+                    onClick={() => setSelectedWalletType('solana')}
+                    className={`flex-1 p-4 rounded-lg border-2 transition-colors ${
+                      selectedWalletType === 'solana'
+                        ? 'border-purple-500 bg-purple-100 text-purple-900'
+                        : 'border-gray-300 bg-white text-gray-700 hover:border-purple-300'
+                    }`}
+                  >
+                    <div className="flex items-center justify-center mb-2">
+                      <div className="w-8 h-8 bg-purple-600 rounded-full flex items-center justify-center">
+                        <span className="text-white font-bold text-sm">◎</span>
+                      </div>
+                    </div>
+                    <div className="font-semibold">Solana</div>
+                    <div className="text-sm opacity-75">High Performance</div>
+                  </button>
+                </div>
+                <button
+                  className="w-full bg-blue-600 text-white px-6 py-3 rounded-xl font-semibold hover:bg-blue-700 transition-colors"
+                  onClick={handleCreateNewWallet}
+                >
+                  + Create {selectedWalletType === 'ethereum' ? 'Ethereum' : 'Solana'} Wallet
+                </button>
+              </div>
+
               {wallets.length === 0 ? (
                 <div className="text-center py-12">
                   <div className="w-16 h-16 bg-gray-100 rounded-full flex items-center justify-center mx-auto mb-4">
@@ -403,8 +492,23 @@ export default function Home() {
                   {wallets.map((w, i) => (
                     <div key={i} className="border border-gray-200 rounded-xl p-6 hover:border-blue-300 transition-colors">
                       <div className="flex items-center justify-between mb-4">
-                        <h3 className="font-semibold text-gray-900">Wallet #{i + 1}</h3>
-                        <div className="text-sm text-gray-500">Path: m/44'/60'/0'/{w.path}</div>
+                        <div className="flex items-center space-x-3">
+                          <div className={`w-8 h-8 rounded-full flex items-center justify-center ${
+                            w.type === 'ethereum' ? 'bg-blue-100' : 'bg-purple-100'
+                          }`}>
+                            <span className={`font-bold text-sm ${
+                              w.type === 'ethereum' ? 'text-blue-600' : 'text-purple-600'
+                            }`}>
+                              {w.type === 'ethereum' ? 'Ξ' : '◎'}
+                            </span>
+                          </div>
+                          <div>
+                            <h3 className="font-semibold text-gray-900">
+                              {w.type === 'ethereum' ? 'Ethereum' : 'Solana'} Wallet #{i + 1}
+                            </h3>
+                            <div className="text-sm text-gray-500">Path: {w.path}</div>
+                          </div>
+                        </div>
                       </div>
                       <div className="space-y-3">
                         <div>
@@ -437,12 +541,6 @@ export default function Home() {
               )}
 
               <div className="flex gap-4">
-                <button
-                  className="flex-1 bg-blue-600 text-white px-6 py-3 rounded-xl font-semibold hover:bg-blue-700 transition-colors"
-                  onClick={handleCreateNewWallet}
-                >
-                  + Create New Wallet
-                </button>
                 <button
                   className="px-6 py-3 bg-gray-200 text-gray-700 rounded-xl font-semibold hover:bg-gray-300 transition-colors"
                   onClick={() => setPage(3)}
